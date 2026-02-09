@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import json
 import time
-from urllib.parse import quote
+from urllib.parse import urlparse, urlunparse
 
 # Page configuration
 st.set_page_config(
@@ -72,12 +72,19 @@ if use_custom:
         help="Enter any CDX-compatible server URL"
     )
 
-# Match type
+# Match type - DEFAULT TO DOMAIN (smart choice)
 match_type = st.sidebar.selectbox(
     "Match Type",
-    ["exact", "prefix", "host", "domain"],
+    ["domain", "prefix", "host", "exact"],
     index=0,
-    help="exact: exact URL | prefix: URL prefix | host: hostname | domain: domain + subdomains"
+    help="domain: domain + subdomains (RECOMMENDED) | prefix: URL prefix | host: hostname only | exact: exact URL"
+)
+
+# URL variant retry
+auto_retry_variants = st.sidebar.checkbox(
+    "Auto-retry URL variants",
+    value=True,
+    help="Automatically try http/https, www/non-www variants if no results found"
 )
 
 # Result limit per URL
@@ -141,8 +148,8 @@ st.header("📝 Enter URLs")
 url_input = st.text_area(
     "Enter URLs (one per line)",
     height=150,
-    placeholder="https://example.com\nhttps://stake.com\nhttps://commoncrawl.org",
-    help="Enter one URL per line"
+    placeholder="example.com\nstake.com\nhttps://commoncrawl.org",
+    help="Enter one URL per line (protocol optional for domain/prefix match)"
 )
 
 # File upload option
@@ -172,6 +179,55 @@ if clear_button:
     st.session_state.results = []
     st.session_state.query_run = False
     st.rerun()
+
+# Function to generate URL variants
+def generate_url_variants(url):
+    """Generate common URL variants (http/https, www/non-www)"""
+    variants = [url]
+    
+    # Parse URL
+    if not url.startswith(('http://', 'https://')):
+        variants.append(f'http://{url}')
+        variants.append(f'https://{url}')
+        url = f'http://{url}'  # Use for parsing
+    
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        # www variant
+        if domain.startswith('www.'):
+            non_www = domain[4:]
+            variants.append(urlunparse(parsed._replace(netloc=non_www)))
+        else:
+            www_version = f'www.{domain}'
+            variants.append(urlunparse(parsed._replace(netloc=www_version)))
+        
+        # Protocol variant
+        if parsed.scheme == 'http':
+            variants.append(url.replace('http://', 'https://'))
+        else:
+            variants.append(url.replace('https://', 'http://'))
+        
+        # Trailing slash variants
+        path = parsed.path
+        if path.endswith('/'):
+            variants.append(urlunparse(parsed._replace(path=path.rstrip('/'))))
+        else:
+            variants.append(urlunparse(parsed._replace(path=path + '/')))
+    
+    except:
+        pass
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_variants = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            unique_variants.append(v)
+    
+    return unique_variants
 
 # Function to query CDX Server API
 def query_cdx_api(cdx_server, url, match_type, limit, timeout, filter_status=None, filter_mime=None, from_ts=None, to_ts=None, output='json', fl=None):
@@ -228,16 +284,20 @@ def query_cdx_api(cdx_server, url, match_type, limit, timeout, filter_status=Non
                     if line:
                         results.append({'raw': line})
             
-            return results, None
+            return results, None, 'success'
+        
+        elif response.status_code == 404:
+            # 404 means no captures found, not an error
+            return [], None, 'no_captures'
         else:
-            return [], f"HTTP {response.status_code}: {response.text[:100]}"
+            return [], f"HTTP {response.status_code}: {response.text[:100]}", 'error'
             
     except requests.exceptions.Timeout:
-        return [], f"Timeout: Request exceeded {timeout} seconds"
+        return [], f"Timeout: Request exceeded {timeout} seconds", 'timeout'
     except requests.exceptions.ConnectionError:
-        return [], "Connection error: Could not connect to CDX server"
+        return [], "Connection error: Could not connect to CDX server", 'error'
     except Exception as e:
-        return [], f"Error: {str(e)[:100]}"
+        return [], f"Error: {str(e)[:100]}", 'error'
 
 # Process queries
 if query_button and url_input:
@@ -258,7 +318,7 @@ if query_button and url_input:
             to_ts = to_date.strftime('%Y%m%d%H%M%S')
         
         # Display query info
-        st.info(f"🔍 Querying **{selected_server}** with match type: **{match_type}**")
+        st.info(f"🔍 Querying **{selected_server}** with match type: **{match_type}** | Auto-retry: **{auto_retry_variants}**")
         
         # Progress tracking
         progress_bar = st.progress(0)
@@ -271,7 +331,7 @@ if query_button and url_input:
             start_time = time.time()
             
             # Query CDX API
-            results, error = query_cdx_api(
+            results, error, status = query_cdx_api(
                 cdx_server,
                 url,
                 match_type,
@@ -285,28 +345,78 @@ if query_button and url_input:
                 fl_fields
             )
             
+            # Try variants if no results and auto-retry is enabled
+            tried_variants = [url]
+            if status == 'no_captures' and auto_retry_variants and match_type == 'exact':
+                variants = generate_url_variants(url)
+                for variant in variants:
+                    if variant not in tried_variants:
+                        tried_variants.append(variant)
+                        results, error, status = query_cdx_api(
+                            cdx_server,
+                            variant,
+                            match_type,
+                            limit,
+                            timeout_seconds,
+                            filter_status,
+                            filter_mime,
+                            from_ts,
+                            to_ts,
+                            output_format,
+                            fl_fields
+                        )
+                        if status == 'success':
+                            st.info(f"🔄 Found results using variant: {variant}")
+                            break
+            
             elapsed = time.time() - start_time
             
-            if error:
+            # Handle results based on status
+            if status == 'error' or status == 'timeout':
+                # Real error - add to error tracking
                 st.session_state.results.append({
                     'query_url': url,
-                    'error': error,
-                    'urlkey': '-',
-                    'timestamp': '-',
-                    'url': '-',
-                    'mime': '-',
-                    'status': '-',
-                    'digest': '-',
-                    'length': '-'
+                    'result_type': 'error',
+                    'error_message': error,
+                    'captures_found': 0,
+                    'urlkey': None,
+                    'timestamp': None,
+                    'url': None,
+                    'mime': None,
+                    'status': None,
+                    'digest': None,
+                    'length': None
                 })
                 st.warning(f"⚠️ {url}: {error} (took {elapsed:.1f}s)")
+            
+            elif status == 'no_captures':
+                # No captures found - this is normal, not an error
+                st.session_state.results.append({
+                    'query_url': url,
+                    'result_type': 'no_captures',
+                    'error_message': None,
+                    'captures_found': 0,
+                    'urlkey': None,
+                    'timestamp': None,
+                    'url': None,
+                    'mime': None,
+                    'status': None,
+                    'digest': None,
+                    'length': None
+                })
+                st.info(f"ℹ️ {url}: No captures found in this index (took {elapsed:.1f}s)")
+            
             else:
+                # Success - found captures
                 if results:
                     for result in results:
                         result['query_url'] = url
+                        result['result_type'] = 'capture'
+                        result['error_message'] = None
+                        result['captures_found'] = len(results)
+                        
                         # Handle both JSON and text format
                         if 'raw' in result:
-                            # Parse text format (space-separated)
                             parts = result['raw'].split()
                             if len(parts) >= 7:
                                 result.update({
@@ -320,19 +430,7 @@ if query_button and url_input:
                                 })
                     
                     st.session_state.results.extend(results)
-                    st.success(f"✅ {url}: Found {len(results)} results (took {elapsed:.1f}s)")
-                else:
-                    st.session_state.results.append({
-                        'query_url': url,
-                        'urlkey': '-',
-                        'timestamp': '-',
-                        'url': 'No results found',
-                        'mime': '-',
-                        'status': '-',
-                        'digest': '-',
-                        'length': '-'
-                    })
-                    st.info(f"ℹ️ {url}: No results found (took {elapsed:.1f}s)")
+                    st.success(f"✅ {url}: Found {len(results)} capture(s) (took {elapsed:.1f}s)")
             
             # Update progress
             progress_bar.progress((idx + 1) / len(urls))
@@ -352,41 +450,49 @@ if st.session_state.query_run and st.session_state.results:
     # Convert to DataFrame
     df = pd.DataFrame(st.session_state.results)
     
-    # Display statistics - FIXED
+    # Calculate statistics properly
+    total_queries = df['query_url'].nunique() if 'query_url' in df.columns else 0
+    total_captures = len(df[df['result_type'] == 'capture']) if 'result_type' in df.columns else 0
+    no_captures = len(df[df['result_type'] == 'no_captures']) if 'result_type' in df.columns else 0
+    errors = len(df[df['result_type'] == 'error']) if 'result_type' in df.columns else 0
+    
+    # Display statistics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Total Results", len(df))
+        st.metric("URLs Queried", total_queries)
     with col2:
-        unique_urls = df['query_url'].nunique() if 'query_url' in df.columns else 0
-        st.metric("URLs Queried", unique_urls)
+        st.metric("Captures Found", total_captures, help="Total capture records returned")
     with col3:
-        successful = 0
-        if 'url' in df.columns:
-            successful = len(df[df['url'] != 'No results found'])
-            if 'error' in df.columns:
-                successful -= len(df[df['error'].notna()])
-        st.metric("Successful Captures", successful)
+        st.metric("No Captures", no_captures, help="URLs with 0 captures (normal, not an error)")
     with col4:
-        errors = 0
-        if 'error' in df.columns:
-            errors = len(df[df['error'].notna()])
-        st.metric("Errors/Timeouts", errors)
+        st.metric("Real Errors", errors, help="Timeouts, connection errors, server errors")
     
     # Filter controls
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        show_errors = st.checkbox("Show errors/timeouts", value=True)
+        show_captures = st.checkbox("Show captures", value=True)
     with col2:
-        show_no_results = st.checkbox("Show 'no results' entries", value=False)
+        show_no_captures = st.checkbox("Show 'no captures' entries", value=False)
+    with col3:
+        show_errors = st.checkbox("Show errors", value=True)
     
-    # Filter dataframe - FIXED
+    # Filter dataframe
     display_df = df.copy()
     
-    if not show_errors and 'error' in display_df.columns:
-        display_df = display_df[display_df['error'].isna()]
-    
-    if not show_no_results and 'url' in display_df.columns:
-        display_df = display_df[display_df['url'] != 'No results found']
+    if 'result_type' in display_df.columns:
+        mask = []
+        if show_captures:
+            mask.append(display_df['result_type'] == 'capture')
+        if show_no_captures:
+            mask.append(display_df['result_type'] == 'no_captures')
+        if show_errors:
+            mask.append(display_df['result_type'] == 'error')
+        
+        if mask:
+            combined_mask = mask[0]
+            for m in mask[1:]:
+                combined_mask = combined_mask | m
+            display_df = display_df[combined_mask]
     
     # Display table
     st.dataframe(
@@ -421,29 +527,24 @@ if st.session_state.query_run and st.session_state.results:
 # Footer with information
 st.markdown("---")
 st.markdown("""
-### ℹ️ CDX Server API Documentation
+### ℹ️ Understanding Results
 
-This tool uses the **CDX Server API** directly for fast, reliable queries.
+**Result Types:**
+- **Captures Found**: Actual archived snapshots from Common Crawl
+- **No Captures**: URL not found in this index (normal, not an error)
+- **Real Errors**: Connection timeouts, server errors, rate limits
 
-**Match Types:**
-- **exact**: Matches the URL exactly
+**Match Types (defaults to "domain" - recommended):**
+- **domain** ⭐: Matches domain + all subdomains (e.g., `*.example.com`) - BEST for existence checking
 - **prefix**: Matches URLs starting with the given prefix (e.g., `example.com/*`)
-- **host**: Matches all URLs from the given host
-- **domain**: Matches the domain and all subdomains (e.g., `*.example.com`)
+- **host**: Matches only the specific hostname
+- **exact**: Exact URL match only - use only for specific URL queries
 
-**Filter Syntax:**
-- `=status:200` - Exact match for HTTP 200
-- `!=status:404` - Not equal to 404
-- `~mime:text/.*` - Regex match for MIME type
+**Auto-retry URL variants:**
+When enabled, automatically tries http/https and www/non-www variants if the exact URL returns no results.
 
-**Example Queries:**
-URL: example.com
-Match Type: domain
-Status Filter: 200
-MIME Filter: text/html
-            
+**Why "no captures found" is normal:**
+Common Crawl doesn't archive every URL on the internet. Missing from one monthly index doesn't mean the site is broken - it just means it wasn't captured during that crawl period.
 
 **API Reference:** https://github.com/webrecorder/pywb/wiki/CDX-Server-API
-
-**Note:** Each CDX index represents one month of Common Crawl data. Query the latest index for recent captures.
 """)
